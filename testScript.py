@@ -1,125 +1,68 @@
-import torch
-import torchaudio
-import torch.nn as nn
-import numpy as np
 import sounddevice as sd
+import numpy as np
+import tensorflow as tf
 import librosa
 import os
-import time
 import soundfile as sf
+from datetime import datetime
 
-# ================== CONFIG ===================
-TARGET_SAMPLE_RATE = 27000
-RECORD_DURATION = 5  # seconds
-AUDIO_LENGTH = TARGET_SAMPLE_RATE * RECORD_DURATION
-FIXED_LENGTH = TARGET_SAMPLE_RATE * 5  # 5 seconds
-THRESHOLD = 0.3
-SAVE_DIR = "/home/predrag/PycharmProjects/Leetcode/voiceGamesAI/liveRecording2"
 
-# ================== MODEL ====================
-class CNN(nn.Module):
-    def __init__(self):
-        super(CNN, self).__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(3),
-            nn.Dropout(0.2),
+# Configurations 
+TARGET_SAMPLE_RATE = 22050
+RECORD_SECONDS = 1
+SOUND_LEN = TARGET_SAMPLE_RATE * RECORD_SECONDS
+N_MELS = 64 #standard number of mels
 
-            nn.Conv2d(32, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(3),
-            nn.Dropout(0.4),
+class ReduceSumLayer(tf.keras.layers.Layer):
+    def call(self, inputs):
+        return tf.reduce_sum(inputs, axis=1)
 
-            nn.Conv2d(64, 128, 3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(3),
-            nn.Dropout(0.4),
 
-            nn.Conv2d(128, 256, 3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Dropout(0.4),
-
-            nn.Flatten(),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-# Load model
-model = CNN()
-model.load_state_dict(torch.load("/home/predrag/PycharmProjects/Leetcode/voiceGamesAI/models/model_29_04.pth", map_location=torch.device('cpu')))
-model.eval()
-
-# ============ SILENCE TRIMMING ===============
-def remove_silence(audio_numpy, sample_rate):
-    trimmed_audio, _ = librosa.effects.trim(audio_numpy, top_db=20)
-    return trimmed_audio
-
-# ============ AUDIO PREPROCESSING ============
-def process(audio_numpy):
-    audio_numpy = remove_silence(audio_numpy, TARGET_SAMPLE_RATE)
-
-    if len(audio_numpy) < FIXED_LENGTH:
-        pad_size = FIXED_LENGTH - len(audio_numpy)
-        audio_numpy = np.pad(audio_numpy, (0, pad_size), mode='constant')
+# Normalize audio to fit for the model
+def audio_normalizer(sound):
+    if len(sound) < SOUND_LEN: # if len is less than predefined
+        add_len = SOUND_LEN - len(audio) # increse for add_len
+        sound = np.pad(sound, (0, add_len))# add zeros
     else:
-        audio_numpy = audio_numpy[:FIXED_LENGTH]
+        sound = audio[:SOUND_LEN] # Else, just cut 
 
-    tensor_wave = torch.tensor(audio_numpy, dtype=torch.float32).unsqueeze(0)  # [1, N]
+    spectrogram = librosa.feature.melspectrogram(y=sound, sr=TARGET_SAMPLE_RATE, n_mels=N_MELS) #Generate spectrogram
+    spec_db = librosa.power_to_db(spectrogram, ref=np.max) #Generate spectrogram to decibels
+    result = (spec_db - np.mean(spec_db)) / np.std(spec_db) # Z-score normalize
 
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=TARGET_SAMPLE_RATE, n_mels=64
-    )
-    mel_specgram = mel_transform(tensor_wave)
-    mel_specgram = (mel_specgram - mel_specgram.mean()) / mel_specgram.std()
+    return result.astype(np.float32)
 
-    return mel_specgram.unsqueeze(0).to(torch.float32)  # [1, 1, 64, T]
 
-# =============== PREDICTION ==================
-def predict(audio_numpy, threshold=THRESHOLD):
-    input_tensor = process(audio_numpy)
-    with torch.no_grad():
-        output = model(input_tensor)
-        probability = torch.sigmoid(output).item()
-    return probability >= threshold, probability
+# Laod model
+model = tf.keras.models.load_model("Models/Model_V3.keras",custom_objects={"ReduceSumLayer": ReduceSumLayer})
 
-# ============ SAVE TO FILE ====================
-def save_recording(audio_numpy, directory):
-    os.makedirs(directory, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"recording_{timestamp}.wav"
-    path = os.path.join(directory, filename)
-    sf.write(path, audio_numpy, TARGET_SAMPLE_RATE)
-    return path
 
-# =============== MAIN LOOP ===================
-def main():
-    print("Listening...\n")
-    try:
-        while True:
-            recording = sd.rec(frames=AUDIO_LENGTH, samplerate=TARGET_SAMPLE_RATE, channels=1, dtype='float32')
-            sd.wait()
-            audio = np.squeeze(recording.T)
+#Main part
+while True:
+    print("Listening...")
+    audio = sd.rec(int(RECORD_SECONDS * TARGET_SAMPLE_RATE), samplerate=TARGET_SAMPLE_RATE, channels=1, dtype='float32')
+    sd.wait()
 
-            # Save recording
-            #save_path = save_recording(audio, SAVE_DIR)
+    audio = audio.flatten() # Remove additional dimensions
 
-            detected, probability = predict(audio)
+    rms = np.sqrt(np.mean(audio**2))
+    db = 20 * np.log10(rms + 1e-10)# convert to decibels
+    if db < -20:# check loudness
+        print(f"YOU NEED TO BE MORE LOUD!")
+        continue
+    '''if db>-1:#MAYBE WE DONT NEED TO CHECK IF SOUND IS TOO LOUD
+        print(f"YOU ARE TO LOUD!!!")
+        continue'''
 
-            if detected:
-                print(f"[FART DETECTED] ({probability:.2f}) => ")
-            else:
-                print(f"[UNKNOWN SOUND] ({probability:.2f}) =>")
 
-    except KeyboardInterrupt:
-        print("\nHALT: Stopped by user.")
 
-if __name__ == "__main__":
-    main()
+    mel = audio_normalizer(audio)
+
+    mel = mel[np.newaxis, ..., np.newaxis]  #batch (first 1) and channels (the last 1)
+    audio_arr = model.predict(mel)[0][0]
+    p = tf.sigmoid(audio_arr).numpy()
+
+    if p >= 0.7:
+        print(f"FART {p}")
+    else:
+        print(f"UNKNOWN {p}")
